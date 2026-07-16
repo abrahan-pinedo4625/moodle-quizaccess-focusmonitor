@@ -86,6 +86,14 @@ También puede configurarse un máximo de advertencias visibles. Al alcanzar el 
 
 La tercera opción funciona como cierre suave: no entrega automáticamente el intento, pero impide continuar respondiendo después de alcanzar el límite.
 
+## Descarga
+
+Para instalar el plugin en Moodle, descarga el archivo ZIP desde la sección **Releases**:
+
+**Releases → Focus Monitor 0.6.1 RC1 → Assets → quizaccess_focusmonitor_0.6.1-rc1.zip**
+
+No uses el botón **Code → Download ZIP**, ya que ese archivo corresponde al código fuente del repositorio y no necesariamente al paquete instalable para Moodle.
+
 ## Instalación
 
 1. Subir el ZIP desde:
