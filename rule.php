@@ -225,7 +225,7 @@ class quizaccess_focusmonitor extends quiz_access_rule_base {
      * @param moodle_page $page Page object.
      */
     public function setup_attempt_page($page) {
-        global $CFG;
+        global $CFG, $DB, $USER;
 
         $quiz = $this->quiz;
         $cmid = 0;
@@ -233,7 +233,16 @@ class quizaccess_focusmonitor extends quiz_access_rule_base {
             $cmid = $this->quizobj->get_cmid();
         }
 
+        $attemptid = optional_param('attempt', 0, PARAM_INT);
+        if (!$attemptid) {
+            $attemptid = optional_param('attemptid', 0, PARAM_INT);
+        }
+        $attemptstart = $DB->get_field('quiz_attempts', 'timestart', array(
+            'id' => $attemptid, 'quiz' => $quiz->id, 'userid' => $USER->id,
+        ));
         $config = array(
+            'attemptstart' => $attemptstart ? (int)$attemptstart : 0,
+            'servertime' => time(),
             'ajaxurl' => (new moodle_url('/mod/quiz/accessrule/focusmonitor/ajax.php'))->out(false),
             'quizid' => (int)$quiz->id,
             'cmid' => (int)$cmid,
@@ -262,6 +271,78 @@ class quizaccess_focusmonitor extends quiz_access_rule_base {
 
     var cfg = $json;
     var lastSent = {};
+    var initialClientTime = nowSeconds();
+    var documentId = String(new Date().getTime()) + '_' + Math.random().toString(36).slice(2);
+    var lastQuestion = null;
+    var navigating = false;
+
+    function questionElement(target) {
+        while (target && target !== document) {
+            if (target.nodeType === 1 && /(^|\\s)que(\\s|$)/.test(target.className)) {
+                return target;
+            }
+            target = target.parentNode;
+        }
+        return null;
+    }
+
+    function questionInfo(el) {
+        if (!el) {
+            return null;
+        }
+        // Moodle 3.3 uses q<slot>; newer renderers use question-<usage>-<slot>.
+        var match = /^(?:q|question-\\d+-)(\\d+)$/.exec(el.id || '');
+        var number = el.querySelector('.info .qno');
+        return {
+            slot: match ? parseInt(match[1], 10) : null,
+            number: number ? (number.textContent || '').trim().slice(0, 40) : ''
+        };
+    }
+
+    function captureQuestion(event) {
+        var el = questionElement(event.target);
+        if (el) {
+            lastQuestion = el;
+        }
+    }
+
+    function eventContext() {
+        var elements = document.querySelectorAll('.que');
+        var questions = [];
+        var candidate = null;
+        var bestVisibleHeight = 0;
+        var viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+        for (var i = 0; i < elements.length; i++) {
+            questions.push(questionInfo(elements[i]));
+            var rect = elements[i].getBoundingClientRect();
+            var height = Math.max(0, Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0));
+            if (height > bestVisibleHeight) {
+                bestVisibleHeight = height;
+                candidate = elements[i];
+            }
+        }
+        var source = 'unknown';
+        if (elements.length === 1) {
+            candidate = elements[0];
+            source = 'only_question';
+        } else if (lastQuestion && document.documentElement.contains(lastQuestion)) {
+            candidate = lastQuestion;
+            source = 'last_interaction';
+        } else if (candidate) {
+            source = 'viewport';
+        }
+        var rawpage = param('page');
+        var isattempt = /\\/attempt\\.php$/.test(window.location.pathname);
+        return {
+            contextversion: 1,
+            documentid: documentId,
+            pageindex: isattempt ? (rawpage === '' ? 0 : parseInt(rawpage, 10)) : null,
+            question: questionInfo(candidate),
+            questions: questions,
+            contextsource: source,
+            elapsed: cfg.attemptstart ? Math.max(0, cfg.servertime - cfg.attemptstart + nowSeconds() - initialClientTime) : null
+        };
+    }
 
     function param(name) {
         var match = new RegExp('[?&]' + name + '=([^&]*)').exec(window.location.search);
@@ -359,14 +440,20 @@ class quizaccess_focusmonitor extends quiz_access_rule_base {
     }
 
     function rememberFocusLoss(time, source) {
+        if (navigating) {
+            return;
+        }
         var existing = readFocusLoss();
         if (existing && existing.time) {
             return;
         }
-        writeFocusLoss({time: time, source: source || '', navigating: 0});
+        writeFocusLoss({time: time, source: source || '', navigating: 0, context: eventContext()});
     }
 
     function markStoredNavigation() {
+        navigating = true;
+        outOfFocus = false;
+        focusLostAt = 0;
         var existing = readFocusLoss();
         if (existing && existing.time) {
             existing.navigating = 1;
@@ -385,9 +472,14 @@ class quizaccess_focusmonitor extends quiz_access_rule_base {
         var attemptid = attemptId();
         var cmid = cmId();
         data = data || {};
+        if (!data.context) {
+            data.context = eventContext();
+        }
         if (!data.time) {
             data.time = nowSeconds();
         }
+        data.servertime = cfg.servertime + nowSeconds() - initialClientTime;
+        data.navigating = navigating ? 1 : 0;
         data.path = window.location.pathname;
         data.query = window.location.search;
         data.url = window.location.pathname + window.location.search;
@@ -403,10 +495,12 @@ class quizaccess_focusmonitor extends quiz_access_rule_base {
             '&eventdata=' + encodeURIComponent(JSON.stringify(data));
 
         try {
-            if (navigator.sendBeacon && (eventtype === 'beforeunload' || eventtype === 'pagehide')) {
+            if (navigator.sendBeacon && (eventtype === 'beforeunload' || eventtype === 'pagehide' ||
+                    eventtype === 'window_blur' || eventtype === 'visibility_hidden')) {
                 var blob = new Blob([payload], {type: 'application/x-www-form-urlencoded'});
-                navigator.sendBeacon(cfg.ajaxurl, blob);
-                return;
+                if (navigator.sendBeacon(cfg.ajaxurl, blob)) {
+                    return;
+                }
             }
             var xhr = new XMLHttpRequest();
             xhr.open('POST', cfg.ajaxurl, true);
@@ -518,6 +612,11 @@ class quizaccess_focusmonitor extends quiz_access_rule_base {
 
     function maybeWarnForReturn(now, source) {
         var stored = readFocusLoss();
+        // A different document's marker can belong to normal navigation or bfcache.
+        // It does not establish a focus loss on this page.
+        if (stored && stored.context && stored.context.documentid !== documentId) {
+            stored = null;
+        }
         var start = outOfFocus ? focusLostAt : (stored && stored.time ? parseInt(stored.time, 10) : 0);
         var navigating = stored && stored.navigating ? 1 : 0;
 
@@ -535,9 +634,9 @@ class quizaccess_focusmonitor extends quiz_access_rule_base {
             var count = Math.min(previousCount + 1, maxWarnings);
             writeWarningCount(count);
             var limitReached = count >= maxWarnings;
-            post('focus_warning', {time: now, duration: duration, warning: count, maxwarnings: maxWarnings, source: source || '', repeatedlimit: previousCount >= maxWarnings ? 1 : 0});
+            post('focus_warning', {time: now, duration: duration, warning: count, maxwarnings: maxWarnings, source: source || '', repeatedlimit: previousCount >= maxWarnings ? 1 : 0, context: stored && stored.context ? stored.context : eventContext()});
             if (limitReached && previousCount < maxWarnings) {
-                post('warning_limit_reached', {time: now, duration: duration, warning: count, maxwarnings: maxWarnings, source: source || ''});
+                post('warning_limit_reached', {time: now, duration: duration, warning: count, maxwarnings: maxWarnings, source: source || '', context: stored && stored.context ? stored.context : eventContext()});
             }
             warn(duration, count, limitReached);
         }
@@ -545,6 +644,10 @@ class quizaccess_focusmonitor extends quiz_access_rule_base {
 
     function markFocusLost(source) {
         var now = nowSeconds();
+        if (navigating) {
+            post(source, {time: now});
+            return;
+        }
         if (!outOfFocus) {
             outOfFocus = true;
             focusLostAt = now;
@@ -554,6 +657,9 @@ class quizaccess_focusmonitor extends quiz_access_rule_base {
     }
 
     function markFocusReturned(source) {
+        if (document.hidden) {
+            return;
+        }
         var now = nowSeconds();
         post(source, {time: now});
         maybeWarnForReturn(now, source);
@@ -566,7 +672,7 @@ class quizaccess_focusmonitor extends quiz_access_rule_base {
         // If the previous page unloaded due to normal Moodle navigation, clear the persisted focus marker.
         // This avoids false warnings on slow question-to-question page loads.
         var stored = readFocusLoss();
-        if (stored && stored.navigating) {
+        if (stored && (stored.navigating || (stored.context && stored.context.documentid !== documentId))) {
             clearFocusLoss();
         } else if (stored && stored.time && !document.hidden) {
             window.setTimeout(function() {
@@ -603,6 +709,10 @@ class quizaccess_focusmonitor extends quiz_access_rule_base {
         post('copy', {time: nowSeconds()});
     });
 
+    document.addEventListener('focusin', captureQuestion, false);
+    document.addEventListener('mousedown', captureQuestion, false);
+    document.addEventListener('touchstart', captureQuestion, false);
+
     document.addEventListener('paste', function() {
         post('paste', {time: nowSeconds()});
     });
@@ -631,6 +741,9 @@ class quizaccess_focusmonitor extends quiz_access_rule_base {
     });
 
     window.addEventListener('pagehide', function(event) {
+        if (!document.hidden) {
+            markStoredNavigation();
+        }
         post('pagehide', {time: nowSeconds(), persisted: event && event.persisted ? 1 : 0});
         // Some mobile browsers fire pagehide when the app is backgrounded without a reliable blur event.
         if (document.hidden) {
@@ -639,6 +752,13 @@ class quizaccess_focusmonitor extends quiz_access_rule_base {
     });
 
     window.addEventListener('pageshow', function(event) {
+        if (navigating) {
+            // A cached document resumes after navigation. Its old in-memory loss is stale.
+            navigating = false;
+            outOfFocus = false;
+            focusLostAt = 0;
+            clearFocusLoss();
+        }
         post('pageshow', {time: nowSeconds(), persisted: event && event.persisted ? 1 : 0});
         if (!document.hidden) {
             window.setTimeout(function() {

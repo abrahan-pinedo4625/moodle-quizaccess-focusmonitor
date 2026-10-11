@@ -17,7 +17,7 @@
 defined('MOODLE_INTERNAL') || die();
 
 $plugin->component = 'quizaccess_focusmonitor';
-$plugin->version   = 2026071509;
+$plugin->version   = 2026101001;
 $plugin->requires  = 2017051500; // Moodle 3.3.
 $plugin->maturity  = MATURITY_BETA;
-$plugin->release   = '0.6.1-rc1 for Moodle 3.3+';
+$plugin->release   = '0.6.2-rc2 for Moodle 3.3+';
