@@ -85,5 +85,15 @@ function xmldb_quizaccess_focusmonitor_upgrade($oldversion) {
         upgrade_plugin_savepoint(true, 2026071509, 'quizaccess', 'focusmonitor');
     }
 
+    if ($oldversion < 2026101000) {
+        // Context is stored in the existing eventdata JSON. Preserve settings and logs.
+        upgrade_plugin_savepoint(true, 2026101000, 'quizaccess', 'focusmonitor');
+    }
+
+    if ($oldversion < 2026101001) {
+        // No schema changes. Fix mobile navigation, event delivery and clock alignment.
+        upgrade_plugin_savepoint(true, 2026101001, 'quizaccess', 'focusmonitor');
+    }
+
     return true;
 }

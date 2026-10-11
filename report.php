@@ -64,8 +64,11 @@ function quizaccess_focusmonitor_decode_eventdata($eventdata) {
  * @return int
  */
 function quizaccess_focusmonitor_event_time($record) {
+    if (isset($record->_fmdata['servertime']) && is_numeric($record->_fmdata['servertime'])) {
+        return (int)$record->_fmdata['servertime'];
+    }
     if (isset($record->_fmdata['time']) && is_numeric($record->_fmdata['time'])) {
-        return (int)$record->_fmdata['time'];
+        return (int)$record->_fmdata['time'] + (isset($record->_fmclockoffset) ? $record->_fmclockoffset : 0);
     }
     return (int)$record->timecreated;
 }
@@ -107,7 +110,111 @@ function quizaccess_focusmonitor_is_focus_return_event($eventtype) {
  * @return bool
  */
 function quizaccess_focusmonitor_is_strong_event($eventtype) {
-    return in_array($eventtype, array('copy', 'paste', 'cut', 'contextmenu', 'print_attempt', 'screenshot_key'), true);
+    return in_array($eventtype, array('copy', 'paste', 'cut', 'print_attempt', 'screenshot_key'), true);
+}
+
+/**
+ * Read context from new events, with only verifiable page/time fallback for old logs.
+ * Question numbers are never guessed from page indexes or slot numbers.
+ *
+ * @param stdClass $record Log record.
+ * @return array
+ */
+function quizaccess_focusmonitor_event_context($record) {
+    $data = $record->_fmdata;
+    $context = isset($data['context']) && is_array($data['context']) ? $data['context'] : array();
+    $page = isset($context['pageindex']) && is_numeric($context['pageindex']) ? (int)$context['pageindex'] : null;
+    if ($page === null && isset($data['path']) && basename($data['path']) === 'attempt.php') {
+        if (isset($data['page']) && $data['page'] !== '' && is_numeric($data['page'])) {
+            $page = (int)$data['page'];
+        } else if (!empty($data['query'])) {
+            $params = array();
+            parse_str(ltrim($data['query'], '?'), $params);
+            $page = isset($params['page']) && is_numeric($params['page']) ? (int)$params['page'] : 0;
+        }
+    }
+    $question = isset($context['question']) && is_array($context['question']) ? $context['question'] : array();
+    $elapsed = isset($context['elapsed']) && is_numeric($context['elapsed']) ? max(0, (int)$context['elapsed']) : null;
+    if ($elapsed === null && !empty($record->attempttimestart)) {
+        // Legacy client clocks may differ; use the server receipt time for this fallback.
+        $elapsed = max(0, (int)$record->timecreated - (int)$record->attempttimestart);
+    }
+    return array(
+        'page' => $page === null ? null : $page + 1,
+        'question' => isset($question['number']) && is_scalar($question['number']) ? (string)$question['number'] : '',
+        'slot' => isset($question['slot']) && is_numeric($question['slot']) ? (int)$question['slot'] : null,
+        'source' => isset($context['contextsource']) && is_string($context['contextsource']) ? $context['contextsource'] : 'unknown',
+        'elapsed' => $elapsed,
+    );
+}
+
+/** Return a translated, bounded description of the question attribution method. */
+function quizaccess_focusmonitor_context_source($source) {
+    $allowed = array('only_question', 'last_interaction', 'viewport', 'unknown');
+    if (!in_array($source, $allowed, true)) {
+        $source = 'unknown';
+    }
+    return get_string('context_' . $source, 'quizaccess_focusmonitor');
+}
+
+/** Build an episode with the question context captured at departure. */
+function quizaccess_focusmonitor_episode($record, $end, $confirmed) {
+    return array(
+        'start' => $record->_fmtime,
+        'end' => $end,
+        'duration' => $confirmed ? max(0, $end - $record->_fmtime) : null,
+        'confirmed' => $confirmed,
+        'reconstructed' => false,
+        'documentid' => isset($record->_fmdata['context']['documentid']) ? $record->_fmdata['context']['documentid'] : '',
+        'attemptid' => (int)$record->attemptid,
+        'context' => quizaccess_focusmonitor_event_context($record),
+    );
+}
+
+/** State clearly whether both raw endpoints or only a client warning support an episode. */
+function quizaccess_focusmonitor_episode_status($episode) {
+    if (!empty($episode['reconstructed'])) {
+        return get_string('episodereconstructed', 'quizaccess_focusmonitor');
+    }
+    return get_string($episode['confirmed'] ? 'episodeconfirmed' : 'episodeunconfirmed', 'quizaccess_focusmonitor');
+}
+
+/** Check known document identities; legacy logs can only compare path and page. */
+function quizaccess_focusmonitor_same_document($a, $b) {
+    $ad = $a->_fmdata;
+    $bd = $b->_fmdata;
+    if (!empty($ad['context']['documentid']) && !empty($bd['context']['documentid'])) {
+        return $ad['context']['documentid'] === $bd['context']['documentid'];
+    }
+    if (isset($ad['path'], $bd['path']) && $ad['path'] !== $bd['path']) {
+        return false;
+    }
+    $ac = quizaccess_focusmonitor_event_context($a);
+    $bc = quizaccess_focusmonitor_event_context($b);
+    return $ac['page'] === null || $bc['page'] === null || $ac['page'] === $bc['page'];
+}
+
+/** Return plain context cells for HTML tables and CSV exports. */
+function quizaccess_focusmonitor_context_cells($context, $csv = false) {
+    return array(
+        $context['page'] === null ? '-' : $context['page'],
+        $context['question'] === '' ? '-' : $context['question'],
+        $context['slot'] === null ? '-' : $context['slot'],
+        quizaccess_focusmonitor_context_source($context['source']),
+        $context['elapsed'] === null ? '-' : ($csv ? $context['elapsed'] :
+            quizaccess_focusmonitor_format_duration($context['elapsed'])),
+    );
+}
+
+/** Return context column headings, with explicit units in CSV. */
+function quizaccess_focusmonitor_context_headers($csv = false) {
+    return array(
+        get_string('eventpage', 'quizaccess_focusmonitor'),
+        get_string('eventquestion', 'quizaccess_focusmonitor'),
+        get_string('eventslot', 'quizaccess_focusmonitor'),
+        get_string('contextsource', 'quizaccess_focusmonitor'),
+        get_string($csv ? 'elapsedseconds' : 'elapsedtime', 'quizaccess_focusmonitor'),
+    );
 }
 
 /**
@@ -151,6 +258,11 @@ function quizaccess_focusmonitor_format_duration($seconds) {
         return $minutes . ' min ' . $remaining . ' s';
     }
     return $remaining . ' s';
+}
+
+/** Display event times to the second in the viewer's Moodle timezone. */
+function quizaccess_focusmonitor_datetime($time) {
+    return userdate($time, '%Y-%m-%d %H:%M:%S');
 }
 
 /**
@@ -326,9 +438,14 @@ function quizaccess_focusmonitor_aggregate_summaries($summaries) {
  */
 function quizaccess_focusmonitor_analyse_records($grouprecords) {
     $navigationtimes = array();
+    $departures = array();
     foreach ($grouprecords as $record) {
         if (quizaccess_focusmonitor_is_navigation_event($record->eventtype)) {
             $navigationtimes[] = $record->_fmtime;
+        }
+        if ($record->eventtype === 'beforeunload' || ($record->eventtype === 'pagehide' &&
+                isset($record->_fmdata['visibility']) && $record->_fmdata['visibility'] === 'visible')) {
+            $departures[] = $record;
         }
     }
 
@@ -359,6 +476,7 @@ function quizaccess_focusmonitor_analyse_records($grouprecords) {
 
     $outoffocus = false;
     $focusstart = 0;
+    $focusrecord = null;
     $attemptwindows = array();
 
     foreach ($grouprecords as $record) {
@@ -381,10 +499,34 @@ function quizaccess_focusmonitor_analyse_records($grouprecords) {
         $type = $record->eventtype;
         $time = $record->_fmtime;
         $nearnav = quizaccess_focusmonitor_near_navigation($time, $navigationtimes, 3);
+        // New logs identify document navigation explicitly. For RC1 context logs,
+        // only a departure on the same document can suppress a loss, not a page load elsewhere.
+        if (isset($record->_fmdata['navigating'])) {
+            $nearnav = !empty($record->_fmdata['navigating']);
+        } else if (!empty($record->_fmdata['context']['documentid'])) {
+            $nearnav = false;
+            foreach ($departures as $departure) {
+                if (quizaccess_focusmonitor_same_document($departure, $record) && abs($departure->_fmtime - $time) <= 3) {
+                    $nearnav = true;
+                    break;
+                }
+            }
+        }
         $record->_fmnearnavigation = $nearnav;
 
         if (quizaccess_focusmonitor_is_navigation_event($type)) {
             $summary['navigationcount']++;
+            // A return on another page does not confirm how long the previous page lost focus.
+            // Visible pagehide also covers mobile bfcache navigation without beforeunload.
+            $visiblehide = $type === 'pagehide' && isset($record->_fmdata['visibility']) &&
+                $record->_fmdata['visibility'] === 'visible';
+            if ($outoffocus && ($type === 'page_loaded' ||
+                    (($type === 'beforeunload' || $visiblehide) && quizaccess_focusmonitor_same_document($focusrecord, $record)))) {
+                $summary['episodes'][] = quizaccess_focusmonitor_episode($focusrecord, $time, false);
+                $outoffocus = false;
+                $focusstart = 0;
+                $focusrecord = null;
+            }
             continue;
         }
 
@@ -398,28 +540,47 @@ function quizaccess_focusmonitor_analyse_records($grouprecords) {
                 continue;
             }
             $summary['focuslosscount']++;
+            if ($outoffocus && !quizaccess_focusmonitor_same_document($focusrecord, $record)) {
+                $summary['episodes'][] = quizaccess_focusmonitor_episode($focusrecord, $time, false);
+                $outoffocus = false;
+            }
             if (!$outoffocus) {
                 $outoffocus = true;
                 $focusstart = $time;
+                $focusrecord = $record;
             }
             continue;
         }
 
         if (quizaccess_focusmonitor_is_focus_return_event($type)) {
             if ($outoffocus) {
+                if (isset($record->_fmdata['visibility']) && $record->_fmdata['visibility'] === 'hidden') {
+                    continue;
+                }
+                if (!quizaccess_focusmonitor_same_document($focusrecord, $record)) {
+                    $summary['episodes'][] = quizaccess_focusmonitor_episode($focusrecord, $time, false);
+                    $outoffocus = false;
+                    $focusstart = 0;
+                    $focusrecord = null;
+                    continue;
+                }
                 $duration = max(0, $time - $focusstart);
                 // Ignore very short browser flickers. They are usually UI noise.
                 if ($duration >= 2) {
                     $summary['focusepisodes']++;
                     $summary['focustime'] += $duration;
-                    $summary['episodes'][] = array('start' => $focusstart, 'end' => $time, 'duration' => $duration);
+                    $summary['episodes'][] = quizaccess_focusmonitor_episode($focusrecord, $time, true);
                 }
                 $outoffocus = false;
                 $focusstart = 0;
+                $focusrecord = null;
             }
             continue;
         }
 
+        if ($type === 'contextmenu') {
+            $summary['contextmenucount']++;
+        }
         if (quizaccess_focusmonitor_is_strong_event($type)) {
             $summary['strongcount']++;
             if ($type === 'copy') {
@@ -428,8 +589,6 @@ function quizaccess_focusmonitor_analyse_records($grouprecords) {
                 $summary['pastecount']++;
             } else if ($type === 'cut') {
                 $summary['cutcount']++;
-            } else if ($type === 'contextmenu') {
-                $summary['contextmenucount']++;
             } else if ($type === 'print_attempt') {
                 $summary['printcount']++;
             } else if ($type === 'screenshot_key') {
@@ -463,12 +622,58 @@ function quizaccess_focusmonitor_analyse_records($grouprecords) {
 
     if ($outoffocus && !empty($grouprecords)) {
         $last = end($grouprecords);
-        $duration = max(0, $last->_fmtime - $focusstart);
-        if ($duration >= 2) {
-            $summary['focusepisodes']++;
-            $summary['focustime'] += $duration;
-            $summary['episodes'][] = array('start' => $focusstart, 'end' => $last->_fmtime, 'duration' => $duration);
+        $summary['episodes'][] = quizaccess_focusmonitor_episode($focusrecord, $last->_fmtime, false);
+    }
+
+    // A warning can arrive even when the backgrounded browser failed to deliver the loss event.
+    // Recover those episodes once, with explicit attribution; reject cross-page/navigation warnings.
+    foreach ($grouprecords as $record) {
+        $data = $record->_fmdata;
+        if ($record->eventtype !== 'focus_warning' || empty($data['context']['documentid']) ||
+                !isset($data['duration']) || !is_numeric($data['duration']) || (int)$data['duration'] < 2 ||
+                empty($data['source']) || $data['source'] === 'page_loaded_return') {
+            continue;
         }
+        $duration = (int)$data['duration'];
+        $start = $record->_fmtime - $duration;
+        $neardeparture = false;
+        foreach ($departures as $departure) {
+            if (quizaccess_focusmonitor_same_document($departure, $record) && abs($departure->_fmtime - $start) <= 3) {
+                $neardeparture = true;
+                break;
+            }
+        }
+        if ($neardeparture || (!empty($record->attempttimestart) && $start < $record->attempttimestart) ||
+                (!empty($record->attempttimefinish) && $record->_fmtime > $record->attempttimefinish)) {
+            continue;
+        }
+        $exists = false;
+        $replaceindex = null;
+        foreach ($summary['episodes'] as $index => $episode) {
+            if (!$episode['confirmed'] && $episode['documentid'] === $data['context']['documentid'] &&
+                    abs($episode['start'] - $start) <= 2) {
+                $replaceindex = $index;
+            }
+            if ($episode['confirmed'] && $episode['documentid'] === $data['context']['documentid'] &&
+                    abs($episode['start'] - $start) <= 2 && abs($episode['end'] - $record->_fmtime) <= 2) {
+                $exists = true;
+                break;
+            }
+        }
+        if ($exists) {
+            continue;
+        }
+        $episode = quizaccess_focusmonitor_episode($record, $record->_fmtime, true);
+        $episode['start'] = $start;
+        $episode['duration'] = $duration;
+        $episode['reconstructed'] = true;
+        if ($replaceindex === null) {
+            $summary['episodes'][] = $episode;
+        } else {
+            $summary['episodes'][$replaceindex] = $episode;
+        }
+        $summary['focusepisodes']++;
+        $summary['focustime'] += $duration;
     }
 
     if (!empty($attemptwindows)) {
@@ -495,6 +700,9 @@ function quizaccess_focusmonitor_analyse_records($grouprecords) {
  * @return string
  */
 function quizaccess_focusmonitor_event_category($record) {
+    if ($record->eventtype === 'contextmenu') {
+        return get_string('categoryinteraction', 'quizaccess_focusmonitor');
+    }
     if (quizaccess_focusmonitor_is_strong_event($record->eventtype)) {
         return get_string('categorystrong', 'quizaccess_focusmonitor');
     }
@@ -643,10 +851,26 @@ $records = $DB->get_records_sql("SELECT l.*, u.firstname, u.lastname, u.email, q
                              LEFT JOIN {quiz_attempts} qa ON qa.id = l.attemptid
                                  WHERE l.quizid = :quizid
                               ORDER BY l.timecreated DESC, l.id DESC",
-    array('quizid' => $quiz->id), 0, 2000);
+    array('quizid' => $quiz->id));
 
+$clockoffsets = array();
 foreach ($records as $record) {
     $record->_fmdata = quizaccess_focusmonitor_decode_eventdata($record->eventdata);
+    $data = $record->_fmdata;
+    if ($record->eventtype === 'page_loaded' && !empty($record->attempttimestart) &&
+            !empty($data['context']['documentid']) && isset($data['context']['elapsed'], $data['time']) &&
+            is_numeric($data['context']['elapsed']) && is_numeric($data['time'])) {
+        $clockoffsets[$record->attemptid . ':' . $data['context']['documentid']] =
+            (int)$record->attempttimestart + (int)$data['context']['elapsed'] - (int)$data['time'];
+    }
+}
+foreach ($records as $record) {
+    if (!empty($record->_fmdata['context']['documentid'])) {
+        $key = $record->attemptid . ':' . $record->_fmdata['context']['documentid'];
+        if (isset($clockoffsets[$key])) {
+            $record->_fmclockoffset = $clockoffsets[$key];
+        }
+    }
     $record->_fmtime = quizaccess_focusmonitor_event_time($record);
     $record->_fmnearnavigation = false;
 }
@@ -749,6 +973,40 @@ usort($byattempt, function($a, $b) use ($riskorder) {
 });
 
 
+$episoderows = array();
+foreach ($byuser as $group) {
+    foreach ($group['summary']['episodes'] as $episode) {
+        $episoderows[] = array('user' => $group['user'], 'episode' => $episode);
+    }
+}
+usort($episoderows, function($a, $b) {
+    return $b['episode']['start'] - $a['episode']['start'];
+});
+
+if ($download === 'episodecsv') {
+    $headers = array_merge(array(
+        get_string('student', 'quizaccess_focusmonitor'),
+        get_string('attemptid', 'quizaccess_focusmonitor'),
+        get_string('episodestart', 'quizaccess_focusmonitor'),
+        get_string('episodeend', 'quizaccess_focusmonitor'),
+        get_string('episodedurationseconds', 'quizaccess_focusmonitor'),
+        get_string('episodestatus', 'quizaccess_focusmonitor'),
+    ), quizaccess_focusmonitor_context_headers(true));
+    $rows = array();
+    foreach ($episoderows as $item) {
+        $episode = $item['episode'];
+        $rows[] = array_merge(array(
+            fullname($item['user']),
+            $episode['attemptid'],
+            quizaccess_focusmonitor_datetime($episode['start']),
+            $episode['confirmed'] ? quizaccess_focusmonitor_datetime($episode['end']) : '-',
+            $episode['confirmed'] ? $episode['duration'] : '-',
+            quizaccess_focusmonitor_episode_status($episode),
+        ), quizaccess_focusmonitor_context_cells($episode['context'], true));
+    }
+    quizaccess_focusmonitor_send_csv('focusmonitor_episodes_quiz_' . $quiz->id . '.csv', $headers, $rows);
+}
+
 if ($download === 'summarycsv' || $download === 'eventscsv') {
     if ($download === 'summarycsv') {
         $headers = array(
@@ -805,13 +1063,14 @@ if ($download === 'summarycsv' || $download === 'eventscsv') {
         get_string('eventdata', 'quizaccess_focusmonitor'),
         get_string('ipaddress', 'quizaccess_focusmonitor'),
     );
+    $headers = array_merge($headers, quizaccess_focusmonitor_context_headers(true));
     $rows = array();
     foreach ($chronological as $record) {
         $user = new stdClass();
         $user->firstname = $record->firstname;
         $user->lastname = $record->lastname;
-        $rows[] = array(
-            userdate($record->timecreated),
+        $rows[] = array_merge(array(
+            quizaccess_focusmonitor_datetime($record->_fmtime),
             fullname($user),
             $record->email,
             (int)$record->attemptid,
@@ -819,7 +1078,7 @@ if ($download === 'summarycsv' || $download === 'eventscsv') {
             $record->_fmcategory,
             $record->eventdata,
             $record->ipaddress,
-        );
+        ), quizaccess_focusmonitor_context_cells(quizaccess_focusmonitor_event_context($record), true));
     }
     quizaccess_focusmonitor_send_csv('focusmonitor_events_quiz_' . $quiz->id . '.csv', $headers, $rows);
 }
@@ -855,9 +1114,11 @@ echo $style;
 
 $summarycsvurl = new moodle_url($url, array('download' => 'summarycsv', 'sort' => $sort, 'dir' => $dir));
 $eventscsvurl = new moodle_url($url, array('download' => 'eventscsv', 'sort' => $sort, 'dir' => $dir));
+$episodecsvurl = new moodle_url($url, array('download' => 'episodecsv'));
 $exporthtml = html_writer::start_tag('div', array('class' => 'focusmonitor-exportlinks'));
 $exporthtml .= html_writer::link($summarycsvurl, get_string('exportsummarycsv', 'quizaccess_focusmonitor'));
 $exporthtml .= html_writer::link($eventscsvurl, get_string('exporteventscsv', 'quizaccess_focusmonitor'));
+$exporthtml .= html_writer::link($episodecsvurl, get_string('exportepisodecsv', 'quizaccess_focusmonitor'));
 $exporthtml .= html_writer::tag('span', get_string('sortinstruction', 'quizaccess_focusmonitor'), array('class' => 'focusmonitor-muted'));
 $exporthtml .= html_writer::end_tag('div');
 
@@ -957,6 +1218,34 @@ echo html_writer::table($attempttable);
 echo html_writer::end_tag('details');
 
 echo html_writer::start_tag('details', array('class' => 'focusmonitor-details'));
+echo html_writer::tag('summary', get_string('showepisodes', 'quizaccess_focusmonitor'));
+echo html_writer::tag('p', get_string('episodecontextnote', 'quizaccess_focusmonitor'));
+$episodetable = new html_table();
+$episodetable->attributes['class'] = 'generaltable focusmonitor-table';
+$episodetable->head = array_merge(array(
+    get_string('student', 'quizaccess_focusmonitor'),
+    get_string('attemptid', 'quizaccess_focusmonitor'),
+    get_string('episodestart', 'quizaccess_focusmonitor'),
+    get_string('episodeend', 'quizaccess_focusmonitor'),
+    get_string('episodeduration', 'quizaccess_focusmonitor'),
+    get_string('episodestatus', 'quizaccess_focusmonitor'),
+), quizaccess_focusmonitor_context_headers());
+foreach ($episoderows as $item) {
+    $episode = $item['episode'];
+    $cells = array_merge(array(
+        fullname($item['user']),
+        $episode['attemptid'],
+        quizaccess_focusmonitor_datetime($episode['start']),
+        $episode['confirmed'] ? quizaccess_focusmonitor_datetime($episode['end']) : '-',
+        $episode['confirmed'] ? quizaccess_focusmonitor_format_duration($episode['duration']) : '-',
+        quizaccess_focusmonitor_episode_status($episode),
+    ), quizaccess_focusmonitor_context_cells($episode['context']));
+    $episodetable->data[] = array_map('s', $cells);
+}
+echo html_writer::table($episodetable);
+echo html_writer::end_tag('details');
+
+echo html_writer::start_tag('details', array('class' => 'focusmonitor-details'));
 echo html_writer::tag('summary', get_string('showrawevents', 'quizaccess_focusmonitor'));
 $table = new html_table();
 $table->attributes['class'] = 'generaltable focusmonitor-table';
@@ -969,19 +1258,20 @@ $table->head = array(
     get_string('eventdata', 'quizaccess_focusmonitor'),
     get_string('ipaddress', 'quizaccess_focusmonitor'),
 );
+$table->head = array_merge($table->head, quizaccess_focusmonitor_context_headers());
 foreach ($chronological as $record) {
     $user = new stdClass();
     $user->firstname = $record->firstname;
     $user->lastname = $record->lastname;
-    $table->data[] = array(
-        userdate($record->timecreated),
+    $table->data[] = array_merge(array(
+        quizaccess_focusmonitor_datetime($record->_fmtime),
         fullname($user),
         (int)$record->attemptid,
         s($record->eventtype),
         s($record->_fmcategory),
         html_writer::tag('small', s($record->eventdata)),
         s($record->ipaddress),
-    );
+    ), array_map('s', quizaccess_focusmonitor_context_cells(quizaccess_focusmonitor_event_context($record))));
 }
 echo html_writer::table($table);
 echo html_writer::end_tag('details');
